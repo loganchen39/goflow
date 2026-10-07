@@ -25,7 +25,7 @@ from goflow_core import (
     load_datasets, create_dataloaders,
     initialize_model, load_model, count_parameters
 )
-from dataSST import SatelliteDataset, writeGridSat
+from dataSST import SatelliteDataset, writeGridSat, SAT_CENTRE_OFFSET
 from writenc import ncCreate, addVal
 
 
@@ -240,22 +240,29 @@ def write_satellite_netcdf(
     with NCDataset(goes_file, 'r') as nch:
         varnames = ['U', 'V', 'Vorticity', 'Divergence', 'Strain', 'BT', 'loggrad_BT']
         nc = ncCreate(output_file, nx, ny, varnames, dt=2)
+        nc.cloud_masking = ('Pixels where the GOES clear-sky mask is 0 (cloud, and most land) '
+                            'are NaN in every variable.')
 
         for it in tqdm(range(nt), desc='Writing NetCDF'):
-            BT = nch.variables['BT'][it + 12,
+            # Record it is centred on GOES frame it + SAT_CENTRE_OFFSET (was it + 12,
+            # 5 minutes early); BT and the cloud mask come from that same frame.
+            BT = nch.variables['BT'][it + SAT_CENTRE_OFFSET,
                                      valid_inds[0]:valid_inds[1],
                                      valid_inds[2]:valid_inds[3]]
-            mask = nch.variables['mask'][it + 12,
+            mask = nch.variables['mask'][it + SAT_CENTRE_OFFSET,
                                          valid_inds[0]:valid_inds[1],
                                          valid_inds[2]:valid_inds[3]]
+            # Masked pixels become NaN rather than 0, so "no data" can't be mistaken
+            # for zero velocity / zero gradient.
+            clear = np.where(np.ma.filled(mask, 0) > 0.5, 1.0, np.nan).astype(np.float32)
 
-            addVal(nc, 'U', out_val[it, 0, :, :] * mask, it)
-            addVal(nc, 'V', out_val[it, 1, :, :] * mask, it)
-            addVal(nc, 'Vorticity', grad_val[it, 0, :, :] * mask, it)
-            addVal(nc, 'Divergence', grad_val[it, 1, :, :] * mask, it)
-            addVal(nc, 'Strain', grad_val[it, 2, :, :] * mask, it)
-            addVal(nc, 'BT', BT * mask, it)
-            addVal(nc, 'loggrad_BT', sst_val[it, :, :] * mask, it)
+            addVal(nc, 'U', out_val[it, 0, :, :] * clear, it)
+            addVal(nc, 'V', out_val[it, 1, :, :] * clear, it)
+            addVal(nc, 'Vorticity', grad_val[it, 0, :, :] * clear, it)
+            addVal(nc, 'Divergence', grad_val[it, 1, :, :] * clear, it)
+            addVal(nc, 'Strain', grad_val[it, 2, :, :] * clear, it)
+            addVal(nc, 'BT', np.ma.filled(BT, np.nan) * clear, it)
+            addVal(nc, 'loggrad_BT', sst_val[it, :, :] * clear, it)
 
         nc.close()
 

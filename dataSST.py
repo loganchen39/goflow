@@ -90,6 +90,11 @@ def getData(nch, var: str, ij: tuple, time_slice: int) -> np.ndarray:
 # Dataset Classes
 # =============================================================================
 
+# Sample k of SatelliteDataset uses frames k+1, k+13, k+25; the prediction is for
+# the middle one. Used by writeGridSat to label output records.
+SAT_CENTRE_OFFSET = 13
+
+
 class SatelliteDataset(Dataset):
     """
     PyTorch Dataset for GOES satellite brightness temperature data.
@@ -103,14 +108,20 @@ class SatelliteDataset(Dataset):
         spatial_slice: Tuple (y0, y1, x0, x1) for spatial subsetting
         train: If True, return (input, target) tuples; if False, return input only
         gridField: Optional grid parameters to concatenate with input
+        nan_fill: Normalised value for NaN pixels. In the GOES files NaN marks land only
+            (constant in time; clouds are not NaN). LLC training data has land at
+            loggrad_T = 0, i.e. normalised 1.0, so 1.0 keeps inference consistent with
+            training. The original code filled with 0.0, an input value never seen in
+            training (see docs/learning/goflow_learning_notes.md, step 5).
     """
 
-    def __init__(self, nc_path, var_names, spatial_slice, train=True, gridField=None):
+    def __init__(self, nc_path, var_names, spatial_slice, train=True, gridField=None, nan_fill=1.0):
         self.nc_path = nc_path
         self.var_names = var_names
         self.train = train
         self.spatial_slice = spatial_slice
         self.gridField = gridField
+        self.nan_fill = nan_fill
 
         self.nch = load(self.nc_path, 'r')
         self.time_len = self.nch.dimensions['time'].size - 25
@@ -141,7 +152,7 @@ class SatelliteDataset(Dataset):
         if self.gridField is not None:
             input_slice = np.concatenate([sst_slices, getGrid(self.gridField, self.spatial_slice)], axis=0).astype(np.float32)
         else:
-            input_slice = np.nan_to_num(sst_slices.astype(np.float32))
+            input_slice = np.nan_to_num(sst_slices.astype(np.float32), nan=self.nan_fill)
 
         if self.train:
             # Get velocity fields at the middle time step (i+12)
@@ -309,6 +320,15 @@ def writeGridSat(nc_file_path: str, target: str, spatial_slice: tuple):
     Copies time, lat, lon from source file to target file, adjusting
     time indices for the 3-frame sampling scheme.
 
+    Record it of the target holds SatelliteDataset sample it, whose frames are
+    it+1, it+13, it+25 (__getitem__ shifts idx by 1 and steps by 12). The
+    prediction is for the middle frame, so record it is labelled with the
+    source time of frame it + SAT_CENTRE_OFFSET. The original code used frame
+    it+1 (one hour early for 5-minute GOES data) and wrote ntime-3 labels,
+    which extended the record dimension past the written data with empty
+    records. Time is stored as float64 with the source units/calendar; float32
+    rounded seconds-since-2000 to 64 s steps.
+
     Args:
         nc_file_path: Source satellite data file
         target: Target prediction file to add coordinates to
@@ -317,16 +337,20 @@ def writeGridSat(nc_file_path: str, target: str, spatial_slice: tuple):
     nc = Dataset(nc_file_path, 'r')
     nco = Dataset(target, 'a')
 
-    time = nc.variables['time'][:]
+    time = nc.variables['time']
     lat = nc.variables['lat'][spatial_slice[0]:spatial_slice[1]]
     lon = nc.variables['lon'][spatial_slice[2]:spatial_slice[3]]
     print(len(lat), len(lon))
 
-    # Time indices for middle frames in 3-frame sequences
-    middle_steps = np.arange(1, len(time) - 2, dtype=int)
+    # Time indices for the middle (target) frame of each written record
+    nrec = nco.dimensions['time'].size
+    middle_steps = np.arange(nrec, dtype=int) + SAT_CENTRE_OFFSET
     middle_times = time[middle_steps]
 
-    nco.createVariable('time', np.dtype('float32').char, ('time'))
+    tvar = nco.createVariable('time', 'f8', ('time'))
+    for attr in ('units', 'calendar', 'standard_name', 'long_name'):
+        if attr in time.ncattrs():
+            tvar.setncattr(attr, time.getncattr(attr))
     nco.createVariable('lon', np.dtype('float32').char, ('lon'))
     nco.createVariable('lat', np.dtype('float32').char, ('lat'))
 

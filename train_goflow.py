@@ -34,7 +34,7 @@ from goflow_core import (
 )
 from spectral_loss import spectral_loss
 from utils import cosineSGDR
-from dataSST import SatelliteDataset, writeGridSat
+from dataSST import SatelliteDataset, writeGridSat, SAT_CENTRE_OFFSET
 from writenc import ncCreate, addVal
 
 
@@ -445,7 +445,9 @@ def write_satellite_netcdf(
         nc = ncCreate(output_file, nx, ny, varnames, dt=2)
 
         for it in tqdm(range(nt), desc='Writing NetCDF'):
-            BT = nch.variables['BT'][it + 12, 
+            # Record it is centred on GOES frame it + SAT_CENTRE_OFFSET (was it + 12,
+            # 5 minutes early); BT and the cloud mask come from that same frame.
+            BT = nch.variables['BT'][it + SAT_CENTRE_OFFSET, 
                                      valid_inds[0]:valid_inds[1],
                                      valid_inds[2]:valid_inds[3]]
             addVal(nc, 'U', out_val[it, 0, :, :], it)

@@ -14,6 +14,7 @@ question and answer is appended at the end. Setup, run history and results are i
    - 5.6 Fixing the GOES land encoding and rerunning inference (2026-10-07)
    - 5.7 Fixing the GOES time label (2026-10-07)
    - 5.8 Aligning BT and the cloud mask; cloudy pixels as NaN (2026-10-07)
+6. Training and test boxes over the whole domain (2026-10-07)
 
 ---
 
@@ -804,4 +805,57 @@ where the mask is 0, and the file carries a `cloud_masking` attribute saying so.
 `docs/learning/compare_landfix.py` handles both the old (0) and new (NaN) convention.
 
 The older GOES outputs (`infer_20260929`, `infer_retrained_20260929`) still carry the old time labels.
+
+---
+
+## Step 6: training and test boxes over the whole domain
+
+> **Q (2026-10-07):** Plot the training boxes over the whole domain with `loggrad_T` and the land
+> mask. I think it should have 3 by 4 training boxes (e.g. 551/256 by 1001/256), right?
+> Pick frame 3001.
+
+**Not 3 × 4.** 551/256 ≈ 2.15 and 1001/256 ≈ 3.9, so at most **2 × 3** full 256×256 boxes fit.
+And the code doesn't tile the domain at all. It hard-codes **5 training boxes and 1 test box**
+(`train_goflow.py:596-604`, with `Nx = 1001`):
+
+```python
+train_inds = [(0, 256, 256, 512), (0, 256, 512, 768),          # (row0, row1, col0, col1)
+              (256, 512, 256, 512), (256, 512, 512, 768), (256, 512, Nx - 256, Nx)]
+test_inds  = (0, 256, Nx - 256, Nx)
+valid_inds = (0, 512, Nx - 768, Nx)                            # GOES inference window
+```
+
+Script: `docs/learning/plot_domain_boxes.py`. Background: `loggrad_T` at frame 3001, with
+land (`loggrad_T == 0`) in grey.
+
+![Domain and boxes](../figures/learning_step6_domain_boxes.png)
+
+**How the boxes fit:**
+- **Two rows of boxes**, rows 0–256 (34–39°N) and 256–512 (39–44°N), and **three columns**:
+  256–512, 512–768, and the last 256 columns, 745–1001.
+- **Bottom-right slot = test box, not training.** So 5 of the 6 slots are training.
+- **The last column of boxes is shifted left to end at the domain edge** (745 instead of 768).
+  That's why the test box overlaps training box 2, and box 5 overlaps box 4, by 23 columns
+  (shaded). The overlap is also discussed in step 1.
+
+**Land share per box:**
+
+| Box | Rows, cols | Land |
+|---|---|---|
+| train 1 | 0–256, 256–512 | 0% |
+| train 2 | 0–256, 512–768 | 0% |
+| train 3 | 256–512, 256–512 | **61%** (New England, Long Island) |
+| train 4 | 256–512, 512–768 | 5% |
+| train 5 | 256–512, 745–1001 | 1% |
+| test | 0–256, 745–1001 | 0% |
+
+**Never used for training or testing:**
+- **Columns 0–256** (80–75°W). This is mostly land: the US East Coast and, at the top left,
+  Lake Ontario. It holds only 4% of the domain's ocean pixels.
+- **Rows 512–551** (above 44.2°N). Mostly land; 2% of the ocean pixels.
+- In total the boxes cover **93% of the domain's ocean pixels**. Little ocean is wasted; the
+  leftover strips are mostly land.
+
+**The GOES inference window** (dashed, rows 0–512, cols 233–1001) covers all six boxes plus
+23 extra columns on the left. It's the size of 2 × 3 boxes: 512 × 768.
 

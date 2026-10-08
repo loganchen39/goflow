@@ -19,6 +19,8 @@ question and answer is appended at the end. Setup, run history and results are i
 8. LLC prediction over the 512×768 window, and skill per box (2026-10-07)
 9. Are the 5 training boxes independent samples? (2026-10-07)
 10. Can the trained model be applied to any area? (2026-10-07)
+11. Why train on 256×256 patches instead of the whole domain? (2026-10-07)
+12. Should location and date-time be model inputs? (2026-10-07)
 
 ---
 
@@ -1131,4 +1133,173 @@ in a new ocean region:
 
 **The honest way to use it elsewhere:** first test on simulated data for the new region (e.g. LLC
 output there), where truth exists, then apply it to satellite data. Retrain or fine-tune if skill drops.
+
+---
+
+## Step 11: why train on 256×256 patches instead of the whole domain?
+
+> **Q (2026-10-07):** Why didn't they train on the whole domain, with sizes that are multiples of
+> 16, instead of 256 by 256 patches? I think it would capture the spatial structure better, right?
+
+The repo doesn't state the authors' reasons for 256×256, so what follows is my reading of the
+code and docs, plus the measurements from earlier steps.
+
+### 11.1 Likely reasons for patches
+
+1. **A held-out region needs a spatial split.** Training on the whole domain leaves no unseen area
+   to test on. The README and `docs/spatial_transferability.md` build the evaluation around
+   256×256 boxes: one box is held out per fold to measure **spatial transferability**, the
+   repo's stated concern. Patches make that split natural.
+2. **256 px is already much larger than the model's reach.** A 256-px tile is about 500 km across.
+   The trained model takes 88% of its sensitivity from within 64 px (125 km) of each output pixel
+   (step 3). Gulf Stream meanders and rings, about 150–400 km, mostly fit in a tile. Structure
+   beyond that has little influence on the local velocity.
+3. **More varied batches.** Each batch of 64 mixes many locations and times (step 9). With
+   whole-domain samples, each sample is about 8× the pixels of a 256² tile, so the batch would be
+   about 8 samples, all different times of the same map. Fewer distinct samples per batch also
+   makes BatchNorm's batch statistics noisier.
+4. **Less chance to memorise geography.** The model has no position input, but on a fixed whole
+   domain it could still learn location-specific shortcuts from the coastline shape, land
+   pattern, and where the edges are (zero padding leaks absolute position near borders).
+   Patches at several locations push it toward a location-independent mapping, which is what
+   transfer to GOES and other regions needs.
+5. **It's standard practice**, inherited from the image-segmentation UNet this code is based on
+   (milesial/Pytorch-UNet).
+
+### 11.2 Where you're right: patches cost something at the edges
+
+Context is cut off near tile edges and replaced by zero padding. The share of pixels within
+64 px (the model's main reach) of a tile edge:
+
+| Tile | Share of pixels with edge-truncated context |
+|---|---|
+| 256 × 256 (training tiles) | **75%** |
+| 512 × 768 (GOES window) | 38% |
+| 544 × 992 (cropped full domain) | 33% |
+
+So during training, three-quarters of the pixels are learned with part of their surroundings
+missing. Bigger tiles would reduce that.
+
+**How much it matters:** at inference, giving the test box its real surroundings (512×768 window
+instead of a standalone tile) raised test-box U/V R² from 0.901 to 0.912 (step 8). That's real
+but modest. Training on bigger tiles would probably give a similar-sized gain, not a large one,
+because what's missing near edges is mostly context beyond the model's main reach.
+
+### 11.3 A middle ground that keeps both benefits
+
+- **Train on random crops instead of fixed boxes.** For example, 384×384 or 512×512 crops at random
+  positions within the training area. This gives larger context, many locations, and no fixed
+  edge positions.
+- **Hold out time as well as, or instead of, space** (step 9.2). For example, train on the first
+  10 months and test on the last 2. A whole-domain or large-crop model can then still be tested
+  honestly.
+- **Run inference on large windows** whose sizes are multiples of 16 (steps 8 and 10).
+
+Whether this beats the current setup is an empirical question. It would need a retraining run
+(about 2–3 GPU hours for both stages at the current recipe) and a comparison on the same held-out data.
+
+---
+
+## Step 12: should location and date-time be model inputs?
+
+> **Q (2026-10-07):** I just think there's a "mismatch" between those smaller training boxes and the
+> whole domain of GOES inference. If for a year of data we train on 10 months and test on the
+> remaining 2 months, the dynamics may be different between these 10 and the 2 months. In my opinion
+> the location (e.g. latitude and longitude) and the date-time information should be very important to
+> make a good match between training and predicting. What are your thoughts?
+
+You're pointing at real issues. The answer depends on *how* the information is given to the model:
+encoded as physics it can help; given raw it is more likely to make transfer worse.
+
+### 12.1 The box vs window "mismatch": smaller than it looks
+
+The model is a local operator. Each output pixel depends on roughly a 60–125 km neighbourhood
+(step 3), not on the size of the tile around it. So applying a model trained on 256×256 tiles to a
+512×768 window is not a mismatch in itself. We measured it: the bigger window *raised* test-box R²
+(0.901 → 0.912, step 8), as long as the size is a multiple of 16 (step 10).
+
+The mismatches that do matter for GOES are about **inputs** (step 5.4):
+- satellite vs simulated SST gradients (GOES gradients are stronger on average);
+- cloud texture in the input;
+- a different year from the simulation.
+
+### 12.2 The 10 months / 2 months concern: that's the point of a time holdout
+
+If the last 2 months have different dynamics, a time holdout will show a drop in skill, and that is
+exactly what it should measure. The GOES data (May 2023) is also "a period the model never saw". The
+current spatial split hides this, because the test box covers the same dates as training (step 9.2).
+
+The real constraint is that the LLC file covers about one year (8230 hourly frames ≈ 343 days), so
+each season is seen once. Holding out 2 consecutive months removes a season entirely. Fairer designs:
+- **Blocked cross-validation by month:** 12 folds, each holding out one month, with a gap of a few
+  days on each side to avoid near-duplicates (step 9.2). Results averaged across folds.
+- **Or hold out short blocks spread across the year** (e.g. one week per month). Every season is
+  then represented in training and tested.
+
+### 12.3 Location and date-time as inputs: helpful if physical, risky if raw
+
+**Why you're right that they carry information:**
+- **Latitude sets the Coriolis parameter** f = 2Ω sin(lat). For geostrophic flow, the same front pattern
+  implies a velocity proportional to 1/f. Across this domain sin(lat) changes from 0.56 (34°N) to
+  0.70 (44°N), about **25%**. The model has no way to know this today: its only inputs are the 3 SST
+  channels (step 10).
+- **Bathymetry decides the regime.** The New England shelf box has R² 0.49 against 0.97 in the deep
+  Gulf Stream (step 8); shelf flow responds to tides and wind and is tied less to SST fronts. A depth
+  input would tell the model which regime it is in.
+- **Season changes the SST–flow relationship.** The mixed layer is shallow in summer and deep in
+  winter, and SST gradients are seasonally stronger or weaker. A smooth day-of-year signal could help
+  the model interpret the same gradient differently by season.
+
+**Why raw lat/lon and date-time are risky:**
+- **They let the model memorise instead of infer.** With only one year, (lon, lat, date) almost
+  uniquely identifies a training sample. The easiest way to lower the training loss is then "at this
+  place on this date the Gulf Stream was here", a lookup of the simulation's own history, rather than
+  reading velocity from the fronts.
+  - In-sample scores would go up.
+  - Real skill on new data would not, and could fall.
+- **Eddies are chaotic.** The specific eddies of the simulated year don't recur in 2023. Only the
+  *statistics* (mean Gulf Stream path, seasonal cycle) carry over to GOES. A model keyed to absolute
+  date or exact position learns the specifics.
+- **Extrapolation.** In the spatial holdout the test box has (lon, lat) values never seen in training,
+  and in a time holdout the dates are new. Raw-coordinate features are then out of range at exactly
+  the places and times we care about. For another region (step 10.2) everything is out of range.
+- **Longitude has no direct physical meaning.** Physics depends on latitude (f) and depth, not on
+  longitude. Longitude mostly works as a location ID, which is the memorisation risk above.
+
+**What would likely help instead** (transferable, physically motivated):
+
+| Input | Encodes | Transferable? |
+|---|---|---|
+| sin(lat), or f | Coriolis, the geostrophic scaling | Yes |
+| log bathymetry | shelf vs slope vs deep ocean | Yes |
+| sin/cos of day-of-year | season, smoothly | Partly; seen only once in one year of data |
+| Per-location normalisation of log∇T (subtract each pixel's own time mean, divide by its std) | local "climatology" | The README's own proposed fix for transferability |
+| raw lon, absolute date | identity | No: memorisation risk |
+
+### 12.4 The code already has hooks for this
+
+- `dataSST.loadGridParams` builds extra input channels: sin/cos(lat), |sin|/|cos|(lon) and log
+  bathymetry. `SSTDataset` and `SatelliteDataset` accept them through `gridField`, which adds them
+  as extra channels next to the 3 SST frames. Training currently passes `gridField=None`.
+- `unet_parts_t.py` has `TemporalEncoding` and `DoubleConvTime` (time-conditioned blocks).
+  They're commented out in `UNet`.
+- `unet_vel_bn.py`'s header says it "includes additional potential variants that were not found to
+  improve". The authors evidently tried some of these, though the repo doesn't record which, or under
+  which split.
+- **Missing piece:** `loadGridParams` needs a bathymetry variable `h`, and the LLC file doesn't have one.
+  A bathymetry field on the same 0.02° grid would have to be added (e.g. from the LLC grid files or
+  GEBCO/ETOPO).
+
+### 12.5 How to settle it
+
+Train variants with the same recipe and compare them on **both** a spatial holdout and a blocked time
+holdout:
+1. baseline (current);
+2. + sin(lat);
+3. + sin(lat) + log bathymetry;
+4. + sin/cos(day-of-year);
+5. + raw lon/lat, as a check on memorisation.
+
+My expectation (to be tested, not a result): (2) and (3) help modestly, with (3) helping most on the
+shelf. (4) is mixed with one year of data. (5) looks good in-sample but no better or worse out of sample.
 

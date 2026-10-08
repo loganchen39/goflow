@@ -15,6 +15,10 @@ question and answer is appended at the end. Setup, run history and results are i
    - 5.7 Fixing the GOES time label (2026-10-07)
    - 5.8 Aligning BT and the cloud mask; cloudy pixels as NaN (2026-10-07)
 6. Training and test boxes over the whole domain (2026-10-07)
+7. Why `test_results_epoch.nc` is only 256×256 (2026-10-07)
+8. LLC prediction over the 512×768 window, and skill per box (2026-10-07)
+9. Are the 5 training boxes independent samples? (2026-10-07)
+10. Can the trained model be applied to any area? (2026-10-07)
 
 ---
 
@@ -858,4 +862,273 @@ land (`loggrad_T == 0`) in grey.
 
 **The GOES inference window** (dashed, rows 0–512, cols 233–1001) covers all six boxes plus
 23 extra columns on the left. It's the size of 2 × 3 boxes: 512 × 768.
+
+---
+
+## Step 7: why `test_results_epoch.nc` is only 256×256
+
+> **Q (2026-10-07):** Why does the inference output file, e.g.
+> `infer_retrained_20260929/stage_0.0cs/ncfiles/test_results_epoch.nc`, have dimensions of only
+> 256 by 256? Does it cover only one training box, not the entire Gulf Stream domain?
+
+**It covers exactly one box, and it's the test box, not a training box.** Its job is the
+held-out evaluation, so it contains only the region the model never trained on.
+
+| | |
+|---|---|
+| Region | rows 0–256, cols 745–1001 = 34.0–39.1°N, 65.1–60.0°W (bottom-right box in the step 6 figure) |
+| Dimensions | `time` 2742 × `lat` 256 × `lon` 256, with no lat/lon coordinate variables |
+| `time` | 2742 test samples: sample k is the 3-frame window starting at LLC frame 3k, with the target at frame **3k + 1** |
+
+Checked directly: `U_inp[k]` equals LLC `U[3k+1, 0:256, 745:1001]` at k = 0 and 1000, and
+does not match training box 2 or 5.
+
+**Why only this box:**
+- `inf_llc_stage1.py` builds its LLC dataset from `test_inds = (0, 256, Nx-256, Nx)` only
+  (:375, :401), exactly as training's test set. Its purpose is to reproduce the test
+  metrics and save truth and prediction side by side for analysis.
+- Predicting on the training boxes wouldn't be a fair test: the model has seen those pixels
+  and times, so its skill there would be inflated.
+
+**Where the larger domain does appear:**
+- The GOES satellite output `preds_*.nc` covers the 512×768 window (rows 0–512, cols 233–1001),
+  i.e. all six boxes. But that's real satellite data, so there's no truth to compare against.
+- There is currently **no LLC prediction over the whole domain**. To make one, the model can be
+  run on bigger tiles, because it's fully convolutional. The tile height and width should be
+  multiples of 16 (4 stride-2 levels), e.g. 512×768 or 544×992. Other sizes, including the full
+  551×1001, *run* but give worse predictions (step 10). Only the test box would be an honest
+  evaluation; the rest would be in-sample.
+
+---
+
+## Step 8: LLC prediction over the 512×768 window
+
+> **Q (2026-10-07):** Yes, plot the LLC prediction over the 512×768 window.
+
+Script: `docs/learning/plot_llc_window_prediction.py`.
+
+- **One pass over the window.** Both checkpoints are run on the window rows 0–512, cols 233–1001
+  in a single pass. The UNet is fully convolutional, and 512 and 768 are divisible by 16.
+- **Inputs built as in training**, the same way `SSTDataset` does: 3 consecutive `loggrad_T`
+  frames normalised as `(v + 19) / 19`, with U/V truth at the middle frame.
+- **The plotted sample** is target frame 3001, the same time as the step 2 sample.
+
+![LLC window prediction](../figures/learning_step8_llc_window.png)
+
+**What the figure shows:**
+- **Large scales are right everywhere.** The Gulf Stream meander, the two warm-core rings
+  (one in training box 1, one in the test box) and the shelf-slope flow are all in the right place.
+- **Stage 0 is smoother than stage 1**, as in step 4.
+- **Errors concentrate in three places:** ring interiors, the strongest jet core, and the
+  northern shelf (training boxes 3 and 4).
+- **No seams at box boundaries.** The predicted fields are continuous across the box edges,
+  because the whole window was one tile.
+
+### Skill per box
+
+R² of U/V (pooled) and of vorticity, over 60 samples spread evenly through the 8230-frame
+record. Ocean pixels only, 8-px interior crop of each box.
+
+| Box | Data role | Stage 0 U/V | Stage 0 vorticity | Stage 1 U/V | Stage 1 vorticity | Stage 0 RMSE (m/s) | Truth std (m/s) |
+|---|---|---|---|---|---|---|---|
+| train 1 (south-west) | training | 0.966 | 0.761 | 0.962 | 0.732 | 0.080 | 0.429 |
+| train 2 (south-centre) | training | 0.968 | 0.746 | 0.962 | 0.713 | 0.078 | 0.436 |
+| train 3 (New England shelf) | training | **0.491** | 0.322 | 0.490 | 0.213 | **0.124** | 0.173 |
+| train 4 (north-centre) | training | 0.758 | 0.527 | 0.742 | 0.474 | 0.118 | 0.241 |
+| train 5 (north-east) | training | 0.899 | 0.537 | 0.854 | 0.230 | 0.055 | 0.174 |
+| **TEST** (south-east) | held out | **0.912** | 0.636 | 0.907 | 0.594 | 0.118 | 0.396 |
+
+**What the numbers say:**
+
+- **There is a real train/test gap, but it's modest.** Compare the test box with the two
+  southern training boxes, which have similar Gulf Stream/ring dynamics and similar signal
+  (truth std ≈ 0.40–0.44 m/s). The test RMSE is about 1.5× larger (0.118 vs 0.08 m/s), and
+  U/V R² is 0.91 vs 0.97. So the model fits its training region better than new ocean, but
+  it still generalises well.
+- **Region matters more than train vs test.** The northern training boxes score *worse* than the
+  held-out test box, even though the model was trained on them.
+  - **Train 3 (New England shelf, 61% land):** the largest RMSE of all boxes (0.124 m/s) on a
+    weak signal (std 0.17), so R² is only 0.49. Shelf currents here appear to be poorly
+    determined by SST fronts. A likely reason, not checked here, is that the LLC simulation
+    includes tides and wind-driven shelf flow, which leave little SST signature.
+  - **Train 5:** the smallest RMSE (0.055 m/s), but also a weak signal, so its R² (0.90) is lower
+    than the southern boxes. R² depends on how much variance there is to explain, not only on
+    the error size.
+- **Stage 1 loses more vorticity skill in the north** (box 5: 0.54 → 0.23). The extra
+  small-scale energy from the spectral loss (step 4) is placed less accurately where the
+  signal is weak.
+
+### One big tile beats 256×256 tiles
+
+Same 60 samples, test box, 8-px crop, comparing the model run on the standalone 256×256 test
+tile (as `inf_llc_stage1.py` does) against the one-pass 512×768 window:
+
+| | 256×256 tile, U/V | 512×768 window, U/V | 256×256 tile, vorticity | 512×768 window, vorticity |
+|---|---|---|---|---|
+| Stage 0 | 0.901 | **0.912** | 0.626 | **0.636** |
+| Stage 1 | 0.900 | **0.907** | 0.594 | 0.594 |
+
+With the bigger window, the test box no longer has artificial zero-padded edges, and the model
+sees the real fronts beyond them. Its reach is about 60 km (step 3), so this context helps.
+This uses only *inputs* from neighbouring areas at the same time, not their velocities, so it
+isn't leakage. **Running inference on larger tiles is a free improvement** for both LLC and GOES
+(the GOES path already uses the 512×768 window).
+
+### Note: steps 6–8 use LLC data only
+
+> **Q (2026-10-07):** So from step 6 to 8, the training and test data are all from the LLC model,
+> no GOES satellite data is involved at all, right?
+
+Right.
+- **Steps 6, 7 and 8 use only the LLC simulation file** `llcGoes_gradT_trunc.nc`: inputs
+  (`loggrad_T`), truth (`U`, `V`) and predictions.
+- **The only GOES-related thing in step 6** is the outline of the GOES inference window
+  (`valid_inds`), drawn for reference; no satellite values are plotted.
+
+More generally, **GOES data never enters training.** `train_goflow.py` opens the GOES file only
+to read the grid width (`Nx = 1001`), and optionally to write satellite predictions at the end,
+which we skipped. The model learns entirely from simulated SST gradients and simulated currents,
+then is applied to real satellite gradients in step 5. That's a sim-to-real transfer with no
+satellite truth to check against, which is why the GOES results can only be judged for physical
+plausibility (step 5.6) or against independent observations.
+
+---
+
+## Step 9: are the 5 training boxes independent samples?
+
+> **Q (2026-10-07):** For one training sample, e.g. 1000 with frames 3000–3002, since the entire
+> domain is divided into 5 training boxes and 1 test box, can I say that each of these 5 training
+> boxes is an independent training sample, independent of each other in terms of deep learning
+> training? Previously I was confused about the relationship between these training and test
+> boxes and the entire domain.
+
+**Short answer:** as far as the training code is concerned, yes: each box at each time is a
+separate sample, and the model never sees the whole domain during training. Statistically, no:
+the samples are strongly correlated, in time more than in space.
+
+### 9.1 How the code treats them: separate samples
+
+- **Each box is its own dataset.** `load_datasets` makes one `SSTDataset` per training box, with
+  2742 time samples each, and joins them with `ConcatDataset` (`goflow_core.py:213-217`).
+  The training set is a flat list of **5 × 2742 = 13,710** (box, time) samples:
+
+  | Global index | Box | Local sample |
+  |---|---|---|
+  | 0–2741 | train 1 | 0–2741 |
+  | 2742–5483 | train 2 | 0–2741 |
+  | … | … | … |
+  | 10968–13709 | train 5 | 0–2741 |
+
+  So "sample 1000" (frames 3000–3002) exists **5 times** in the training set, at global indices
+  1000, 3742, 6484, 9226 and 11968, once per box. (Checked: each equals that box's local
+  sample 1000.)
+- **They are shuffled apart.** The DataLoader shuffles all 13,710 indices each epoch. A batch of
+  64 is a random mix of boxes and times, and the 5 boxes from the same moment usually land in
+  different batches.
+- **Each 256×256 tile is processed in isolation.** The UNet sees one box at a time, with zero
+  padding at its edges. No information flows between boxes, so the model never learns from
+  the whole domain at once. It only learns a mapping from "a 256×256 patch of SST gradients"
+  to "the velocity in that patch".
+- **One small exception:** in training mode, BatchNorm normalises with statistics computed over
+  the whole batch (step 3), so samples in the same batch interact slightly through those
+  statistics. At inference (eval mode) this goes away.
+
+So from the deep-learning point of view the domain is just a **source of patches**. Boxes are
+not parts of one big training image.
+
+### 9.2 Statistically: not independent
+
+| Kind of dependence | Evidence |
+|---|---|
+| **Consecutive times are almost identical.** Samples are 3 hours apart. | U/V correlation between sample 1000 and the next one (3 h later): **1.00**; 1 day later: 0.89; 1 week: 0.45; 30 days: 0.34; 150 days: 0.31 (box 2) |
+| **Overlapping boxes share pixels.** | Boxes 4 and 5 contain the *same* 23 columns at the same times (checked: identical). Same for test box and box 2 (step 1). |
+| **Neighbouring boxes share the same flow.** | At one moment the Gulf Stream and its rings cross several boxes (step 8 figure), so adjacent boxes see different pieces of the same eddies. |
+
+**Consequences:**
+- **Far fewer effectively independent samples than 13,710.** With correlation still 0.89 after a
+  day and about 0.45 after a week, the 2742 times per box behave more like a few hundred truly
+  different ocean states. (The ~0.3 floor at long lags reflects the persistent mean flow, such as
+  the typical Gulf Stream path, not short-term memory.)
+- **The test set is held out in space, not in time.** The test box covers the *same 8230 frames*
+  as training, so on test day d the model was trained on boxes right next to it, on the same day,
+  with the same Gulf Stream state. This tests **spatial generalisation** (new location, same
+  period). It doesn't test generalisation to a new year or season. A stricter test would hold out
+  a block of time as well, e.g. train on the first 10 months and test on the last 2.
+
+### 9.3 Correction: the boxes don't divide the entire domain
+
+The 6 boxes cover a 2 × 3 layout over rows 0–512, cols 256–1001 (step 6), not the full
+551 × 1001 domain. Columns 0–256 and rows 512–551 are never used. They're mostly land, so the
+boxes still contain 93% of the ocean pixels.
+
+### 9.4 How it fits together
+
+- **Domain:** where the patches come from.
+- **Boxes:** fixed patch locations. Five are used to learn the patch-to-velocity mapping, and one
+  (the test box) is kept aside to check that the mapping works at a location it never trained on.
+- **Inference:** the learned mapping isn't tied to 256×256. It can be applied to other window
+  sizes, as done for the 512×768 window in step 8 and for GOES in step 5, within the limits
+  set out in step 10.
+
+---
+
+## Step 10: can the trained model be applied to any area?
+
+> **Q (2026-10-07):** So after this UNet model is trained with these LLC training and test boxes,
+> it can be applied to any area, as done for inference of the whole domain of GOES data, right?
+
+**Technically it runs on any area. Whether the answer is good depends on the conditions below.**
+(A small correction too: GOES inference used the 512×768 window, rows 0–512 and cols 233–1001,
+not the whole 551×1001 domain.)
+
+### 10.1 Window size: use multiples of 16
+
+The model accepts any height and width; the padding/cropping step in `Up.forward` makes the
+sizes fit. But I tested the stage 0 model on the same frame (target 3001) with different window
+sizes, all containing the test box, and scored the test box (8-px crop):
+
+| Window (H × W) | H mod 16, W mod 16 | Mean change vs 512×768 (m/s) | Test-box U/V R² |
+|---|---|---|---|
+| 512 × 768 (reference) | 0, 0 | — | **0.926** |
+| 528 × 768 | 0, 0 | 0.0006 | 0.926 |
+| 544 × 768 | 0, 0 | 0.0011 | 0.926 |
+| 544 × 992 | 0, 0 | 0.0032 | 0.925 |
+| 520 × 768 | 8, 0 | 0.031 | 0.913 |
+| 512 × 769 | 0, 1 | 0.068 | 0.892 |
+| **513 × 768** (one extra row) | 1, 0 | 0.090 | **0.773** |
+| **551 × 1001** (full domain) | 7, 9 | 0.081 | **0.874** |
+
+**Why:** each stride-2 level rounds odd sizes up (551 → 276 → 138 → 69 → 35). On the way back
+up, bicubic ×2 gives 70 instead of 69, and `Up.forward` crops or pads one side to match. That
+shifts the coarse, large-scale features against the full-resolution skip connections by a pixel
+at each affected level, i.e. several pixels at full resolution. The model never saw that kind of
+misalignment in training, where 256 is a multiple of 16.
+
+**Rule:** crop or pad any input to multiples of 16 before running the model. For the full LLC
+domain, use 544 × 992 (crop) or pad to 560 × 1008.
+
+### 10.2 What "any area" requires scientifically
+
+The network only knows "a patch of normalised log-SST-gradient frames → velocity". It works
+well only where new inputs look like its training inputs.
+
+| Requirement | Why it matters | Status for GOES |
+|---|---|---|
+| **Same grid spacing**, about 0.02° (≈ 2 km) | Kernels work in pixels: a 3-px front means 6 km. On a 1-km or 4-km grid, the same pixel pattern means a different physical scale. | Same 0.02° grid, OK |
+| **Same frame spacing**, 1 hour between the 3 frames | The frame-to-frame changes encode motion (step 3: 55% of sensitivity is on the earlier/later frames). | GOES frames i, i+12, i+24 at 5 min = 1 h, OK |
+| **Same input definition and normalisation** (log gradient magnitude, `(v + 19)/19`) | BatchNorm statistics are fixed from training. | GOES gradients are stronger on average (+0.6 BatchNorm std, step 5.4); a domain shift |
+| **Same land/missing encoding** (1.0) | Other values are far out of distribution. | Fixed in step 5.6. Clouds are still in the input. |
+| **Similar ocean dynamics** | Trained only on 34–44°N, around the Gulf Stream. The model has **no position input** (no lat/lon, only the 3 SST channels), so it can't adjust for latitude, Coriolis or regime. | Same region, OK |
+
+**Even inside the training domain, skill varies a lot by regime**: velocity R² is 0.97 in the
+southern Gulf Stream boxes but 0.49 on the New England shelf (step 8). Expect similar or worse
+in a new ocean region:
+- **Other western boundary currents** (Kuroshio, Agulhas): plausible, but needs checking against
+  truth (another simulation) before trusting it.
+- **Tropics or the Southern Ocean:** a different dynamical regime (weak Coriolis near the
+  equator, different eddy scales). Skill should be assumed poor until shown otherwise.
+- **Coastal shelves:** already weak in-domain.
+
+**The honest way to use it elsewhere:** first test on simulated data for the new region (e.g. LLC
+output there), where truth exists, then apply it to satellite data. Retrain or fine-tune if skill drops.
 
